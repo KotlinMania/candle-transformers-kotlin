@@ -1,7 +1,8 @@
 [versions]
 kotlin = "2.4.20"
 coroutines = "1.11.0"
-serialization = "1.11.0"
+serde = "0.1.11"
+serdeJson = "0.1.1"
 datetime = "0.8.0"
 collectionsImmutable = "0.5.2"
 androidKmp = "9.4.1"
@@ -26,7 +27,6 @@ clap = "0.1.2"
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
-kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 android-kmp = { id = "com.android.kotlin.multiplatform.library", version.ref = "androidKmp" }
 detekt = { id = "dev.detekt", version.ref = "detekt" }
 ktlint = { id = "org.jlleitschuh.gradle.ktlint", version.ref = "ktlint" }
@@ -36,8 +36,8 @@ kotlin-allopen = { id = "org.jetbrains.kotlin.plugin.allopen", version.ref = "ko
 [libraries]
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
-kotlinx-serialization-core = { module = "org.jetbrains.kotlinx:kotlinx-serialization-core", version.ref = "serialization" }
-kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
+serde-kotlin = { module = "io.github.kotlinmania:serde-kotlin", version.ref = "serde" }
+serde-json-kotlin = { module = "io.github.kotlinmania:serde-json-kotlin", version.ref = "serdeJson" }
 kotlinx-datetime = { module = "org.jetbrains.kotlinx:kotlinx-datetime", version.ref = "datetime" }
 collections-immutable = { module = "org.jetbrains.kotlinx:kotlinx-collections-immutable", version.ref = "collectionsImmutable" }
 kotlinx-benchmark-runtime = { module = "org.jetbrains.kotlinx:kotlinx-benchmark-runtime", version.ref = "kotlinxBenchmark" }
@@ -59,8 +59,8 @@ clap-kotlin = { module = "io.github.kotlinmania:clap-kotlin", version.ref = "cla
 [bundles]
 candletransformers-commonMain = [
   "kotlinx-coroutines-core",
-  "kotlinx-serialization-core",
-  "kotlinx-serialization-json",
+  "serde-kotlin",
+  "serde-json-kotlin",
   "kotlinx-datetime",
   "collections-immutable",
   "candle-kotlin",
