@@ -136,6 +136,12 @@ val intellijCoroutinesVersion =
 // dependency population, so keep the default embeddable runner explicit too.
 val projectDependencyHandler = project.dependencies
 configurations.configureEach {
+    // proc-macro-kotlin's published Android artifact bundles the JetBrains
+    // annotation classes, which duplicate org.jetbrains:annotations on the
+    // Android device-test classpath.
+    if (name.contains("androidDeviceTest", ignoreCase = true)) {
+        exclude(group = "org.jetbrains", module = "annotations")
+    }
     if (name == "swiftExportClasspath") {
         dependencies.add(projectDependencyHandler.create("org.jetbrains.kotlin:swift-export-embeddable:$kotlinVersion"))
         dependencies.add(
@@ -145,6 +151,27 @@ configurations.configureEach {
         )
     }
 }
+
+// Test name patterns to skip in browser test runs (js and wasmJs), from
+// project.js.browserTestExcludes as a comma-separated list. Use for tests that
+// need Node-only modules such as fs or path.
+val browserTestExcludes =
+    providers
+        .gradleProperty("project.js.browserTestExcludes")
+        .getOrElse("")
+        .split(',')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+
+// Extra Kotlin compiler arguments for this repo, from
+// project.kotlin.freeCompilerArgs as a comma-separated list (empty by default).
+val extraKotlinCompilerArgs =
+    providers
+        .gradleProperty("project.kotlin.freeCompilerArgs")
+        .getOrElse("")
+        .split(',')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
 
 // Opt-ins shared across Kotlin targets.
 val commonOptIns =
@@ -333,9 +360,21 @@ writeAndroidLocalProperties()
 
 fun requestedTaskWantsAndroid(rawTaskName: String): Boolean {
     val taskName = rawTaskName.substringAfterLast(':')
-    if (taskName.contains("AndroidNative")) return false // Kotlin/Native, no SDK
-    if (taskName.contains("Android")) return true // direct AGP tasks
-    return taskName in setOf("build", "assemble", "check") // aggregates pull android
+    if (taskName.contains("AndroidNative", ignoreCase = true)) return false // Kotlin/Native, no SDK
+    if (taskName.contains("Android", ignoreCase = true)) return true // direct AGP tasks
+    return taskName in
+        setOf(
+            "build",
+            "assemble",
+            "check",
+            "test",
+            "hostTests",
+            "classes",
+            "testClasses",
+            "allTests",
+            "assembleUnitTest",
+            "assembleAndroidTest",
+        )
 }
 
 if (gradle.startParameter.taskNames.any(::requestedTaskWantsAndroid)) {
@@ -358,8 +397,12 @@ tasks
     .matching { task ->
         val taskName = task.name
         taskName != "ensureAndroidSdk" &&
-            taskName.contains("Android") &&
-            !taskName.contains("AndroidNative")
+            taskName != "setupAndroidSdk" &&
+            (
+                taskName.contains("Android", ignoreCase = true) ||
+                    taskName in setOf("assembleUnitTest", "assembleAndroidTest")
+            ) &&
+            !taskName.contains("AndroidNative", ignoreCase = true)
     }.configureEach {
         dependsOn(ensureAndroidSdk)
     }
@@ -388,7 +431,20 @@ val jvmToolchainVersion = providers.gradleProperty("jvm.toolchain").getOrElse("2
 kotlin {
     jvmToolchain(jvmToolchainVersion)
 
-    applyDefaultHierarchyTemplate()
+    // Default hierarchy plus a named posix group: shared POSIX code for every
+    // native target except mingw (Apple, Linux, Android Native) lives in
+    // src/posixMain and src/posixTest as real shared source sets.
+    applyDefaultHierarchyTemplate {
+        common {
+            group("native") {
+                group("posix") {
+                    group("apple")
+                    group("linux")
+                    group("androidNative")
+                }
+            }
+        }
+    }
 
     compilerOptions {
         languageVersion.set(KotlinVersion.KOTLIN_2_4)
@@ -396,6 +452,7 @@ kotlin {
         allWarningsAsErrors.set(true)
         optIn.addAll(commonOptIns)
         freeCompilerArgs.addAll("-Xexpect-actual-classes", "-Xsuppress-version-warnings")
+        freeCompilerArgs.addAll(extraKotlinCompilerArgs)
     }
 
     val xcf = XCFramework(frameworkName)
@@ -465,16 +522,37 @@ kotlin {
     // Web
     js {
         configureBenchmarkCompilation()
-        browser()
-        nodejs()
+        browser {
+            testTask {
+                browserTestExcludes.forEach { filter.excludeTestsMatching(it) }
+            }
+        }
+        nodejs {
+            testTask {
+                // Mocha's 2s default times out heavy conformance suites on a loaded host.
+                useMocha {
+                    timeout = "120s"
+                }
+            }
+        }
     }
 
     // wasmJs is Stable as of Kotlin 2.2; @OptIn may be removable — verify before dropping on wasmWasi.
     @OptIn(ExperimentalWasmDsl::class)
     wasmJs {
         configureBenchmarkCompilation()
-        browser()
-        nodejs()
+        browser {
+            testTask {
+                browserTestExcludes.forEach { filter.excludeTestsMatching(it) }
+            }
+        }
+        nodejs {
+            testTask {
+                useMocha {
+                    timeout = "120s"
+                }
+            }
+        }
     }
 
     @OptIn(ExperimentalWasmDsl::class)
@@ -773,6 +851,15 @@ kotlin {
     }
 
     sourceSets {
+        // The template's native-binding placeholders live in the template
+        // package. The project.ffi.* switches decide whether they compile, the
+        // same way they gate the C/JNI/N-API builds.
+        if (!napiFfiEnabled) {
+            jsMain { kotlin.exclude("io/github/kotlinmania/template/**") }
+        }
+        if (!jvmFfiEnabled) {
+            jvmMain { kotlin.exclude("io/github/kotlinmania/template/internal/**") }
+        }
         commonMain.dependencies {
             implementation(commonMainDependencyBundle)
         }
@@ -899,7 +986,19 @@ tasks.named("check") {
 // ============================================================================
 // JS / Wasm toolchain pins
 // ============================================================================
-val nodeVersion = providers.gradleProperty("node.version").getOrElse("24.15.0")
+// V8 old-generation heap for every Node process the build starts: Mocha and
+// Karma test runners (js, wasmJs, wasmWasi) and webpack bundling. Node's
+// default is sized from host memory and can starve large test bundles.
+val nodeMaxOldSpaceSizeMb = providers.gradleProperty("node.maxOldSpaceSizeMb").getOrElse("4096")
+val nodeHeapArg = "--max-old-space-size=$nodeMaxOldSpaceSizeMb"
+tasks.withType<org.jetbrains.kotlin.gradle.targets.js.testing.KotlinJsTest>().configureEach {
+    nodeJsArgs += nodeHeapArg
+}
+tasks.withType<org.jetbrains.kotlin.gradle.targets.js.webpack.KotlinWebpack>().configureEach {
+    nodeArgs += nodeHeapArg
+}
+
+val nodeVersion = providers.gradleProperty("node.version").getOrElse("24.22.0")
 val wasmNodeVersion = providers.gradleProperty("wasm.node.version").getOrElse(nodeVersion)
 val yarnVersion = providers.gradleProperty("yarn.version").getOrElse("1.22.22")
 val wasmYarnVersion = providers.gradleProperty("wasm.yarn.version").getOrElse(yarnVersion)
@@ -912,7 +1011,7 @@ val wasmYarnVersion = providers.gradleProperty("wasm.yarn.version").getOrElse(ya
 // Dependabot cannot see, so a bump there would silently revert the build.)
 @Suppress("UNCHECKED_CAST")
 val webpackVersion: String =
-    (groovy.json.JsonSlurper().parse(rootProject.file("kotlin-js-store/package.json")) as Map<String, Any>)
+    (JsonSlurper().parse(rootProject.file("kotlin-js-store/package.json")) as Map<String, Any>)
         .let { it["dependencies"] as Map<String, Any> }["webpack"] as String
 
 rootProject.extensions.configure<NodeJsEnvSpec>("kotlinNodeJsSpec") { version.set(nodeVersion) }
@@ -929,8 +1028,8 @@ rootProject.extensions.configure<WasmYarnRootEnvSpec>("kotlinWasmYarnSpec") {
 }
 
 rootProject.extensions.configure<YarnRootExtension>("kotlinYarn") {
-    yarnLockMismatchReport = org.jetbrains.kotlin.gradle.targets.js.yarn.YarnLockMismatchReport.WARNING
-    yarnLockAutoReplace = true
+    yarnLockMismatchReportProperty.set(org.jetbrains.kotlin.gradle.targets.js.yarn.YarnLockMismatchReport.WARNING)
+    yarnLockAutoReplaceProperty.set(true)
     providers
         .gradlePropertiesPrefixedBy("yarn.resolution.")
         .getOrElse(emptyMap())
@@ -956,8 +1055,8 @@ val patchedKarmaWebpackPackage =
 //       NodeJsEnvSpec API gains equivalent properties. Track KGP release notes before removing.
 rootProject.extensions.configure<NodeJsRootExtension>("kotlinNodeJs") {
     versions.webpack.version = webpackVersion
-    versions.webpackCli.version = providers.gradleProperty("node.webpackCli.version").getOrElse("7.0.2")
-    versions.karma.version = providers.gradleProperty("node.karma.version").getOrElse("npm:karma-maintained@6.4.7")
+    versions.webpackCli.version = providers.gradleProperty("node.webpackCli.version").getOrElse("7.2.3")
+    versions.karma.version = providers.gradleProperty("node.karma.version").getOrElse("npm:karma-maintained@6.4.8")
     versions.karmaWebpack.version = "file:$patchedKarmaWebpackPackage"
     versions.mocha.version = providers.gradleProperty("node.mocha.version").getOrElse("12.0.0-beta-10")
     versions.kotlinWebHelpers.version = providers.gradleProperty("node.kotlinWebHelpers.version").getOrElse("3.1.0")
@@ -1021,6 +1120,7 @@ val publishProjectName = providers.gradleProperty("project.name").getOrElse("unn
 // an empty one to every Maven publication.
 val emptyJavadocJar =
     tasks.register<Jar>("emptyJavadocJar") {
+        description = "Empty javadoc jar required by Maven Central for every publication."
         archiveClassifier.set("javadoc")
     }
 
@@ -1225,7 +1325,7 @@ val publishToCentralPortal =
 // lifecycle and adds the Android host + Swift Export parity tests.
 tasks.register("test") {
     group = "verification"
-    description = "Runs the commonTest-backed KMP suite, Android host tests, and Swift Export smoke test."
+    description = "Runs tests for every enabled target this host can run, Android host tests, and the Swift Export smoke test."
     dependsOn("hostTests")
     dependsOn("swiftExportSmokeTest")
 }
@@ -1354,25 +1454,86 @@ if (napiFfiEnabled) {
             from(ffiNapiDir)
             into(layout.buildDirectory.dir("js/node_modules/$ffiNpmPackage"))
         }
+    val copyWasmNodeFfi =
+        tasks.register<Copy>("copyWasmNode$ffiName") {
+            dependsOn(buildNodeFfi)
+            from(ffiNapiDir)
+            into(layout.buildDirectory.dir("wasm/node_modules/$ffiNpmPackage"))
+        }
     tasks.matching { it.name.startsWith("jsNodeTest") || it.name.startsWith("wasmJsNodeTest") }.configureEach {
-        dependsOn(copyNodeFfi)
+        dependsOn(copyNodeFfi, copyWasmNodeFfi)
     }
 }
 
-// Explicit test runner. Named hostTests to avoid shadowing the KMP allTests
-// lifecycle task. Do not use findByName/mapNotNull here: missing test tasks
-// mean the target surface drifted and must fail loudly.
+// Propagate JNI and N-API native bindings from composite includedBuilds
+val extraJavaLibPaths = mutableListOf<String>()
+if (jvmFfiEnabled) {
+    extraJavaLibPaths.add(
+        layout.buildDirectory
+            .dir("natives")
+            .get()
+            .asFile.absolutePath,
+    )
+}
+gradle.includedBuilds.forEach { ib ->
+    val ibPropsFile = File(ib.projectDir, "gradle.properties")
+    if (ibPropsFile.exists()) {
+        val ibProps =
+            ibPropsFile
+                .readLines()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && !it.startsWith("#") && '=' in it }
+                .associate { it.substringBefore('=').trim() to it.substringAfter('=').trim() }
+        val ibFfiRaw = (ibProps["project.ffi.name"] ?: "Ffi").trim()
+        val ibFfiName = ibFfiRaw.replaceFirstChar { it.uppercase() }
+        val ibFfiLower = ibFfiRaw.lowercase()
+        val ibJvmFfi = (ibProps["project.ffi.jvm"] ?: "false").trim().lowercase() == "true"
+        val ibNapiFfi = (ibProps["project.ffi.napi"] ?: "false").trim().lowercase() == "true"
+
+        if (ibJvmFfi) {
+            extraJavaLibPaths.add(File(ib.projectDir, "build/natives").absolutePath)
+            tasks.named<Test>("jvmTest") {
+                dependsOn(ib.task(":compile${ibFfiName}Jni"))
+            }
+        }
+        if (ibNapiFfi) {
+            val copyIbNode =
+                tasks.register<Copy>("copyIncludedNode$ibFfiName") {
+                    dependsOn(ib.task(":buildNode$ibFfiName"))
+                    from(File(ib.projectDir, "native/node-$ibFfiLower"))
+                    into(layout.buildDirectory.dir("js/node_modules/@kotlinmania/$ibFfiLower-native-bindings"))
+                }
+            val copyIbWasmNode =
+                tasks.register<Copy>("copyIncludedWasmNode$ibFfiName") {
+                    dependsOn(ib.task(":buildNode$ibFfiName"))
+                    from(File(ib.projectDir, "native/node-$ibFfiLower"))
+                    into(layout.buildDirectory.dir("wasm/node_modules/@kotlinmania/$ibFfiLower-native-bindings"))
+                }
+            tasks.matching { it.name.startsWith("jsNodeTest") || it.name.startsWith("wasmJsNodeTest") }.configureEach {
+                dependsOn(copyIbNode, copyIbWasmNode)
+            }
+        }
+    }
+}
+if (extraJavaLibPaths.isNotEmpty()) {
+    tasks.named<Test>("jvmTest") {
+        systemProperty("java.library.path", extraJavaLibPaths.joinToString(File.pathSeparator))
+    }
+}
+
+// Test runner for every enabled target. allTests is the KMP aggregate: JVM,
+// js and wasmJs (Node and browser), wasmWasi, and every native test target the
+// host can run (macOS, iOS/tvOS/watchOS simulators here; Linux and Windows on
+// their own hosts; the rest are skipped via kotlin.native.ignoreDisabledTargets).
+// Android host tests are added explicitly. Named hostTests so it does not
+// shadow allTests itself.
 tasks.register("hostTests") {
     group = "verification"
-    description = "Runs the required real test suite (jvm, macosArm64, js, wasmJs, wasmWasi, android host)."
+    description = "Runs every enabled target's tests that this host can execute, plus Android host tests."
     dependsOn(
-        "jvmTest",
-        "macosArm64Test",
         "kotlinUpgradeYarnLock",
-        "jsNodeTest",
         "kotlinWasmUpgradeYarnLock",
-        "wasmJsNodeTest",
-        "wasmWasiNodeTest",
+        "allTests",
         "testAndroidHostTest",
     )
 }
@@ -1401,6 +1562,18 @@ tasks.matching { it.name.contains("GenerateSPMPackage") }.configureEach {
                     text = text.replace(".macOS(.v15)", ".macOS(\"15.0\")").replace(".macOS(.v14)", ".macOS(\"15.0\")")
                 }
                 file.writeText(text)
+            }
+            // Swift Export spells Foundation's stream classes by their Objective-C names, which
+            // Swift rejects ("'NSInputStream' has been renamed to 'InputStream'").
+            spmDir.walkTopDown().filter { it.isFile && it.extension == "swift" }.forEach { file ->
+                val text = file.readText()
+                val renamed =
+                    text
+                        .replace("Foundation.NSInputStream", "Foundation.InputStream")
+                        .replace("Foundation.NSOutputStream", "Foundation.OutputStream")
+                if (renamed != text) {
+                    file.writeText(renamed)
+                }
             }
             spmDir.walkTopDown().filter { it.name == "OrgJetbrainsKotlinxKotlinxSerializationCore.swift" }.forEach { file ->
                 val text = file.readText()
@@ -1445,7 +1618,7 @@ tasks.register("swiftExportSmokeTest") {
                 commandLine(
                     "./gradlew",
                     "embedSwiftExportForXcode",
-                    "-Dorg.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g",
+                    "-Dorg.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=2g",
                     "--no-configuration-cache",
                     "--no-daemon",
                     "--console=plain",
@@ -1545,4 +1718,69 @@ val fullTargetBuildTaskNames =
 
 tasks.named("build") {
     dependsOn(fullTargetBuildTaskNames)
+}
+
+tasks.register("classes") {
+    dependsOn(
+        "compileAndroidMain",
+        "jvmMainClasses",
+        "jsMainClasses",
+        "wasmJsMainClasses",
+        "wasmWasiMainClasses",
+    )
+}
+
+tasks.register("testClasses") {
+    dependsOn(
+        "compileAndroidHostTest",
+        "jvmTestClasses",
+        "jsTestClasses",
+        "wasmJsTestClasses",
+        "wasmWasiTestClasses",
+    )
+}
+
+// Kotlin/Wasm's generated WASI test driver preopens no directories (KT-65179), so
+// filesystem tests cannot reach any path. project.wasmWasi.testPreopens lists guest
+// directories to map onto fresh host temporary directories for wasmWasiNodeTest.
+val wasmWasiTestPreopens =
+    providers
+        .gradleProperty("project.wasmWasi.testPreopens")
+        .getOrElse("")
+        .split(',')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+
+if (wasmWasiTestPreopens.isNotEmpty()) {
+    tasks.named("wasmWasiNodeTest") {
+        val driverDir = layout.buildDirectory.dir("compileSync/wasmWasi/test/testDevelopmentExecutable/kotlin")
+        val hostRoot = layout.buildDirectory.dir("tmp/wasmWasiTestPreopens")
+        doFirst {
+            val driver =
+                driverDir
+                    .get()
+                    .asFile
+                    .listFiles { file -> file.name.endsWith("-test.mjs") }
+                    ?.singleOrNull()
+                    ?: throw GradleException("wasmWasi test driver not found in ${driverDir.get().asFile}")
+            val root = hostRoot.get().asFile
+            root.deleteRecursively()
+            val mappings =
+                wasmWasiTestPreopens.mapIndexed { index, guest ->
+                    val host = root.resolve("preopen-$index").apply { mkdirs() }
+                    val hostPath = host.absolutePath.replace("\\", "\\\\")
+                    "'$guest': '$hostPath'"
+                }
+            val text = driver.readText()
+            if (!text.contains("preopens:")) {
+                val patched =
+                    text.replaceFirst(
+                        Regex("""new WASI\(\{"""),
+                        "new WASI({ preopens: { ${mappings.joinToString(", ")} },",
+                    )
+                if (patched == text) throw GradleException("Could not add preopens to ${driver.name}")
+                driver.writeText(patched)
+            }
+        }
+    }
 }
